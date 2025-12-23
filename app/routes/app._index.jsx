@@ -12,11 +12,14 @@ import {
   Box,
   InlineStack,
   Badge,
+  ResourceList,
+  ResourceItem,
+  Avatar
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
-// Loader: fetch locations & count held orders
+// Fetch locations, list held orders, and shop domain
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
@@ -42,16 +45,18 @@ export const loader = async ({ request }) => {
   });
   const savedLocationId = config?.locationId || "";
 
-  // Count on hold orders
-  let heldCount = 0;
+  // Find on hold orders
+  let heldOrders = [];
 
   if (savedLocationId) {
-    // Fetch all unfulfilled orders
     const holdQuery = await admin.graphql(
       `#graphql
         query getHeldOrders($query: String!) {
           orders(first: 50, query: $query) {
             nodes {
+              id
+              name
+              createdAt
               fulfillmentOrders(first: 5) {
                 nodes {
                   id
@@ -67,28 +72,32 @@ export const loader = async ({ request }) => {
           }
         }
       `,
-      {
-        // Search for "unfulfilled" to catch everything that hasn't shipped
-        variables: { query: "fulfillment_status:unfulfilled" }
-      }
+      { variables: { query: "fulfillment_status:unfulfilled" } }
     );
 
     const holdData = await holdQuery.json();
 
-    // Filter manually for ON_HOLD status at specific location
     holdData.data.orders.nodes.forEach(order => {
-      order.fulfillmentOrders.nodes.forEach(fo => {
-        if (fo.assignedLocation.location?.id === savedLocationId && fo.status === 'ON_HOLD') {
-            heldCount++;
-        }
-      });
+      const isHeld = order.fulfillmentOrders.nodes.some(fo =>
+        fo.assignedLocation.location?.id === savedLocationId && fo.status === 'ON_HOLD'
+      );
+
+      if (isHeld) {
+        heldOrders.push({
+          id: order.id,
+          name: order.name,
+          customer: "Customer", // Placeholder
+          date: new Date(order.createdAt).toLocaleDateString()
+        });
+      }
     });
   }
 
   return {
     locations: shopifyLocations,
     savedLocationId,
-    heldCount
+    heldOrders,
+    shopDomain: session.shop // Pass the shop domain to the frontend
   };
 };
 
@@ -98,9 +107,7 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  console.log(`👉 Action triggered with intent: ${intent}`);
-
-  // Case a: save settings
+  // Save settings
   if (intent === "save") {
     const selectedLocationId = formData.get("locationId");
     await prisma.configuration.upsert({
@@ -111,11 +118,10 @@ export const action = async ({ request }) => {
     return { status: "success", message: "Settings saved successfully!" };
   }
 
-  // Case b: release holds
+  // Release holds
   if (intent === "release") {
     const targetLocationId = formData.get("locationId");
 
-    // Find the held orders
     const holdQuery = await admin.graphql(
       `#graphql
         query getHeldOrders($query: String!) {
@@ -142,32 +148,28 @@ export const action = async ({ request }) => {
 
     const holdData = await holdQuery.json();
     const idsToRelease = [];
-    const orderIdsToClean = new Set(); // Use a set to store unique order IDs
+    const orderIdsToClean = new Set();
 
     holdData.data.orders.nodes.forEach(order => {
       order.fulfillmentOrders.nodes.forEach(fo => {
         if (fo.assignedLocation.location?.id === targetLocationId && fo.status === 'ON_HOLD') {
           idsToRelease.push(fo.id);
-          orderIdsToClean.add(order.id); // Add the order ID to our cleanup list
+          orderIdsToClean.add(order.id);
         }
       });
     });
-
-    console.log(`🔓 Found ${idsToRelease.length} holds to release on ${orderIdsToClean.size} orders.`);
 
     if (idsToRelease.length === 0) {
       return { status: "info", message: "No matching held orders found." };
     }
 
-    // Release the fulfillment holds
+    // Release Holds
     for (const id of idsToRelease) {
       await admin.graphql(
         `#graphql
           mutation releaseHold($id: ID!) {
             fulfillmentOrderReleaseHold(id: $id) {
-              userErrors {
-                message
-              }
+              userErrors { message }
             }
           }
         `,
@@ -175,36 +177,29 @@ export const action = async ({ request }) => {
       );
     }
 
-    // Remove the tags
+    // Remove tags
     for (const orderId of orderIdsToClean) {
-      console.log(`🧹 Cleaning tag from Order: ${orderId}`);
       await admin.graphql(
         `#graphql
           mutation tagsRemove($id: ID!, $tags: [String!]!) {
             tagsRemove(id: $id, tags: $tags) {
-              userErrors {
-                message
-              }
+              userErrors { message }
             }
           }
         `,
-        {
-          variables: {
-            id: orderId,
-            tags: ["⚠️ Pre-Sale Hold"] // Must match the tag we added exactly
-          }
-        }
+        { variables: { id: orderId, tags: ["⚠️ Pre-Sale Hold"] } }
       );
     }
 
-    return { status: "success", message: `Released ${idsToRelease.length} orders and removed tags!` };
+    return { status: "success", message: `Released ${idsToRelease.length} orders!` };
   }
 
   return null;
 };
-// UI components
+
+// UI component
 export default function Index() {
-  const { locations, savedLocationId, heldCount } = useLoaderData();
+  const { locations, savedLocationId, heldOrders, shopDomain } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
   const nav = useNavigation();
@@ -272,27 +267,61 @@ export default function Index() {
                 <BlockStack gap="400">
                   <InlineStack align="space-between">
                     <Text as="h2" variant="headingMd">Operations</Text>
-                    {heldCount > 0 ? (
-                        <Badge tone="warning">{heldCount} Orders On Hold</Badge>
+                    {heldOrders.length > 0 ? (
+                        <Badge tone="warning">{heldOrders.length} Orders On Hold</Badge>
                     ) : (
                         <Badge tone="success">All Clear</Badge>
                     )}
                   </InlineStack>
 
-                  <Text as="p">
-                    Ready to ship your pre-sale items from <b>{currentLocationName}</b>?
-                    Click below to release the holds on all matching orders immediately.
-                  </Text>
+                  {heldOrders.length > 0 ? (
+                    <Card>
+                        <ResourceList
+                            resourceName={{singular: 'order', plural: 'orders'}}
+                            items={heldOrders}
+                            renderItem={(item) => {
+                                const {id, name, customer, date} = item;
+
+                                // Extract ID
+                                const orderId = id.split('/').pop();
+
+                                // Build standard https url for new tab
+                                // Note: use the shop domain passed from the loader
+                                const orderUrl = `https://${shopDomain}/admin/orders/${orderId}`;
+
+                                return (
+                                    <ResourceItem
+                                        id={id}
+                                        // Open in new tab
+                                        onClick={() => window.open(orderUrl, "_blank")}
+                                        accessibilityLabel={`View order ${name}`}
+                                        media={
+                                            <Avatar customer size="medium" name={customer} />
+                                        }
+                                    >
+                                        <Text variant="bodyMd" fontWeight="bold" as="h3">
+                                            {name}
+                                        </Text>
+                                        <div>{customer}</div>
+                                        <div>{date}</div>
+                                    </ResourceItem>
+                                );
+                            }}
+                        />
+                    </Card>
+                  ) : (
+                    <Text as="p" tone="subdued">No orders are currently waiting in this location.</Text>
+                  )}
 
                   <Box>
                     <Button
                       variant="primary"
                       tone="critical"
                       onClick={handleRelease}
-                      disabled={heldCount === 0}
+                      disabled={heldOrders.length === 0}
                       loading={isLoading && nav.formData?.get("intent") === "release"}
                     >
-                      Release {heldCount > 0 ? `All ${heldCount} Holds` : "All Holds"}
+                      Release {heldOrders.length > 0 ? `All ${heldOrders.length} Holds` : "All Holds"}
                     </Button>
                   </Box>
                 </BlockStack>
