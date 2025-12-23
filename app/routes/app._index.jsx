@@ -111,15 +111,17 @@ export const action = async ({ request }) => {
     return { status: "success", message: "Settings saved successfully!" };
   }
 
-  // case b: release holds
+  // Case b: release holds
   if (intent === "release") {
     const targetLocationId = formData.get("locationId");
 
+    // Find the held orders
     const holdQuery = await admin.graphql(
       `#graphql
         query getHeldOrders($query: String!) {
           orders(first: 50, query: $query) {
             nodes {
+              id
               fulfillmentOrders(first: 5) {
                 nodes {
                   id
@@ -140,23 +142,25 @@ export const action = async ({ request }) => {
 
     const holdData = await holdQuery.json();
     const idsToRelease = [];
+    const orderIdsToClean = new Set(); // Use a set to store unique order IDs
 
     holdData.data.orders.nodes.forEach(order => {
       order.fulfillmentOrders.nodes.forEach(fo => {
         if (fo.assignedLocation.location?.id === targetLocationId && fo.status === 'ON_HOLD') {
           idsToRelease.push(fo.id);
+          orderIdsToClean.add(order.id); // Add the order ID to our cleanup list
         }
       });
     });
 
-    console.log(`🔓 Found ${idsToRelease.length} orders to release.`);
+    console.log(`🔓 Found ${idsToRelease.length} holds to release on ${orderIdsToClean.size} orders.`);
 
     if (idsToRelease.length === 0) {
       return { status: "info", message: "No matching held orders found." };
     }
 
+    // Release the fulfillment holds
     for (const id of idsToRelease) {
-      console.log(`🚀 Releasing Hold ID: ${id}`);
       await admin.graphql(
         `#graphql
           mutation releaseHold($id: ID!) {
@@ -171,12 +175,33 @@ export const action = async ({ request }) => {
       );
     }
 
-    return { status: "success", message: `Released ${idsToRelease.length} orders!` };
+    // Remove the tags
+    for (const orderId of orderIdsToClean) {
+      console.log(`🧹 Cleaning tag from Order: ${orderId}`);
+      await admin.graphql(
+        `#graphql
+          mutation tagsRemove($id: ID!, $tags: [String!]!) {
+            tagsRemove(id: $id, tags: $tags) {
+              userErrors {
+                message
+              }
+            }
+          }
+        `,
+        {
+          variables: {
+            id: orderId,
+            tags: ["⚠️ Pre-Sale Hold"] // Must match the tag we added exactly
+          }
+        }
+      );
+    }
+
+    return { status: "success", message: `Released ${idsToRelease.length} orders and removed tags!` };
   }
 
   return null;
 };
-
 // UI components
 export default function Index() {
   const { locations, savedLocationId, heldCount } = useLoaderData();
