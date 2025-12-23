@@ -14,7 +14,8 @@ import {
   Badge,
   ResourceList,
   ResourceItem,
-  Avatar
+  Avatar,
+  ButtonGroup
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
@@ -86,7 +87,7 @@ export const loader = async ({ request }) => {
         heldOrders.push({
           id: order.id,
           name: order.name,
-          customer: "Customer", // Placeholder
+          customer: "Customer",
           date: new Date(order.createdAt).toLocaleDateString()
         });
       }
@@ -97,17 +98,17 @@ export const loader = async ({ request }) => {
     locations: shopifyLocations,
     savedLocationId,
     heldOrders,
-    shopDomain: session.shop // Pass the shop domain to the frontend
+    shopDomain: session.shop
   };
 };
 
-// Save settings or release holds
+// Save, release all, or release selected
 export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  // Save settings
+  // Case a: save settings
   if (intent === "save") {
     const selectedLocationId = formData.get("locationId");
     await prisma.configuration.upsert({
@@ -118,10 +119,18 @@ export const action = async ({ request }) => {
     return { status: "success", message: "Settings saved successfully!" };
   }
 
-  // Release holds
-  if (intent === "release") {
+  // Fetch current held orders to process releases
+  if (intent === "release_all" || intent === "release_selected") {
     const targetLocationId = formData.get("locationId");
 
+    // Parse selected IDs if selected
+    let selectedOrderIds = [];
+    if (intent === "release_selected") {
+      const jsonIds = formData.get("selectedOrderIds");
+      selectedOrderIds = JSON.parse(jsonIds);
+    }
+
+    // Fetch unfulfilled orders
     const holdQuery = await admin.graphql(
       `#graphql
         query getHeldOrders($query: String!) {
@@ -151,6 +160,11 @@ export const action = async ({ request }) => {
     const orderIdsToClean = new Set();
 
     holdData.data.orders.nodes.forEach(order => {
+      // If only want to release selected orders & skip orders not in our list
+      if (intent === "release_selected" && !selectedOrderIds.includes(order.id)) {
+        return;
+      }
+
       order.fulfillmentOrders.nodes.forEach(fo => {
         if (fo.assignedLocation.location?.id === targetLocationId && fo.status === 'ON_HOLD') {
           idsToRelease.push(fo.id);
@@ -160,10 +174,10 @@ export const action = async ({ request }) => {
     });
 
     if (idsToRelease.length === 0) {
-      return { status: "info", message: "No matching held orders found." };
+      return { status: "info", message: "No matching held orders found to release." };
     }
 
-    // Release Holds
+    // Release holds
     for (const id of idsToRelease) {
       await admin.graphql(
         `#graphql
@@ -197,35 +211,51 @@ export const action = async ({ request }) => {
   return null;
 };
 
-// UI component
+// UI components
 export default function Index() {
   const { locations, savedLocationId, heldOrders, shopDomain } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
   const nav = useNavigation();
 
-  const [selected, setSelected] = useState(savedLocationId);
+  const [selectedLocation, setSelectedLocation] = useState(savedLocationId);
+  const [selectedItems, setSelectedItems] = useState([]); // State for checkboxes
+
   const isLoading = nav.state === "submitting";
 
   useEffect(() => {
-    setSelected(savedLocationId);
+    setSelectedLocation(savedLocationId);
   }, [savedLocationId]);
+
+  // Clear selection after a successful action
+  useEffect(() => {
+    if (actionData?.status === "success") {
+      setSelectedItems([]);
+    }
+  }, [actionData]);
 
   const handleSave = () => {
     const formData = new FormData();
     formData.append("intent", "save");
-    formData.append("locationId", selected);
+    formData.append("locationId", selectedLocation);
     submit(formData, { method: "POST" });
   };
 
-  const handleRelease = () => {
+  const handleReleaseAll = () => {
     const formData = new FormData();
-    formData.append("intent", "release");
-    formData.append("locationId", selected);
+    formData.append("intent", "release_all");
+    formData.append("locationId", selectedLocation);
     submit(formData, { method: "POST" });
   };
 
-  const currentLocationName = locations.find(l => l.id === selected)?.name || "Pre-Sale";
+  const handleReleaseSelected = () => {
+    const formData = new FormData();
+    formData.append("intent", "release_selected");
+    formData.append("locationId", selectedLocation);
+    // Send the list of IDs as a string
+    formData.append("selectedOrderIds", JSON.stringify(selectedItems));
+    submit(formData, { method: "POST" });
+  };
 
   return (
     <Page title="Chrono Split Dashboard">
@@ -237,6 +267,7 @@ export default function Index() {
           </Banner>
         )}
 
+        {/* Section 1: Configuration */}
         <Layout>
           <Layout.Section>
             <Card>
@@ -248,9 +279,9 @@ export default function Index() {
                 </Text>
                 <Select
                   label="Pre-Sale Location"
-                  options={[{label: "Select...", value: ""}, ...locations.map(l => ({label: l.name, value: l.id}))]}
-                  onChange={setSelected}
-                  value={selected}
+                  options={[{ label: "Select...", value: "" }, ...locations.map(l => ({ label: l.name, value: l.id }))]}
+                  onChange={setSelectedLocation}
+                  value={selectedLocation}
                 />
                 <Box>
                   <Button variant="primary" onClick={handleSave} loading={isLoading && nav.formData?.get("intent") === "save"}>
@@ -261,68 +292,80 @@ export default function Index() {
             </Card>
           </Layout.Section>
 
-          {selected && (
+          {/* Section 2: Operations */}
+          {selectedLocation && (
             <Layout.Section>
               <Card>
                 <BlockStack gap="400">
                   <InlineStack align="space-between">
                     <Text as="h2" variant="headingMd">Operations</Text>
                     {heldOrders.length > 0 ? (
-                        <Badge tone="warning">{heldOrders.length} Orders On Hold</Badge>
+                      <Badge tone="warning">{heldOrders.length} Orders On Hold</Badge>
                     ) : (
-                        <Badge tone="success">All Clear</Badge>
+                      <Badge tone="success">All Clear</Badge>
                     )}
                   </InlineStack>
 
                   {heldOrders.length > 0 ? (
-                    <Card>
-                        <ResourceList
-                            resourceName={{singular: 'order', plural: 'orders'}}
-                            items={heldOrders}
-                            renderItem={(item) => {
-                                const {id, name, customer, date} = item;
+                    <Card padding="0">
+                      {/* SELECTABLE RESOURCE LIST */}
+                      <ResourceList
+                        resourceName={{ singular: 'order', plural: 'orders' }}
+                        items={heldOrders}
+                        selectedItems={selectedItems}
+                        onSelectionChange={setSelectedItems}
+                        selectable
+                        renderItem={(item) => {
+                          const { id, name, customer, date } = item;
+                          const orderId = id.split('/').pop();
+                          const orderUrl = `https://${shopDomain}/admin/orders/${orderId}`;
 
-                                // Extract ID
-                                const orderId = id.split('/').pop();
-
-                                // Build standard https url for new tab
-                                // Note: use the shop domain passed from the loader
-                                const orderUrl = `https://${shopDomain}/admin/orders/${orderId}`;
-
-                                return (
-                                    <ResourceItem
-                                        id={id}
-                                        // Open in new tab
-                                        onClick={() => window.open(orderUrl, "_blank")}
-                                        accessibilityLabel={`View order ${name}`}
-                                        media={
-                                            <Avatar customer size="medium" name={customer} />
-                                        }
-                                    >
-                                        <Text variant="bodyMd" fontWeight="bold" as="h3">
-                                            {name}
-                                        </Text>
-                                        <div>{customer}</div>
-                                        <div>{date}</div>
-                                    </ResourceItem>
-                                );
-                            }}
-                        />
+                          return (
+                            <ResourceItem
+                              id={id}
+                              onClick={() => window.open(orderUrl, "_blank")}
+                              accessibilityLabel={`View order ${name}`}
+                              media={
+                                <Avatar customer size="medium" name={customer} />
+                              }
+                            >
+                              <Text variant="bodyMd" fontWeight="bold" as="h3">
+                                {name}
+                              </Text>
+                              <div>{customer}</div>
+                              <div>{date}</div>
+                            </ResourceItem>
+                          );
+                        }}
+                      />
                     </Card>
                   ) : (
                     <Text as="p" tone="subdued">No orders are currently waiting in this location.</Text>
                   )}
 
+                  {/* Button group */}
                   <Box>
-                    <Button
-                      variant="primary"
-                      tone="critical"
-                      onClick={handleRelease}
-                      disabled={heldOrders.length === 0}
-                      loading={isLoading && nav.formData?.get("intent") === "release"}
-                    >
-                      Release {heldOrders.length > 0 ? `All ${heldOrders.length} Holds` : "All Holds"}
-                    </Button>
+                    <ButtonGroup>
+                      {/* Release selected button */}
+                      <Button
+                        onClick={handleReleaseSelected}
+                        disabled={selectedItems.length === 0} // Only active if items checked
+                        loading={isLoading && nav.formData?.get("intent") === "release_selected"}
+                      >
+                        Release Selected ({selectedItems.length})
+                      </Button>
+
+                      {/* Release all button */}
+                      <Button
+                        variant="primary"
+                        tone="critical"
+                        onClick={handleReleaseAll}
+                        disabled={heldOrders.length === 0}
+                        loading={isLoading && nav.formData?.get("intent") === "release_all"}
+                      >
+                        Release All Holds
+                      </Button>
+                    </ButtonGroup>
                   </Box>
                 </BlockStack>
               </Card>
