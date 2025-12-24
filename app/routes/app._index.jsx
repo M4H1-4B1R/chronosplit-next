@@ -20,40 +20,35 @@ import {
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
-// Fetch locations, list held orders, and shop domain
+// Increased limit to 250 for better coverage
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
-  // Fetch locations
+  // Locations
   const locResponse = await admin.graphql(
     `#graphql
       query {
-        locations(first: 20) {
-          nodes {
-            id
-            name
-          }
-        }
+        locations(first: 20) { nodes { id name } }
       }
     `
   );
   const locData = await locResponse.json();
   const shopifyLocations = locData.data.locations.nodes;
 
-  // Get saved settings
+  // Settings
   const config = await prisma.configuration.findUnique({
     where: { shop: session.shop },
   });
   const savedLocationId = config?.locationId || "";
 
-  // Find on hold orders
+  // Held orders (limited to 250)
   let heldOrders = [];
 
   if (savedLocationId) {
     const holdQuery = await admin.graphql(
       `#graphql
         query getHeldOrders($query: String!) {
-          orders(first: 50, query: $query) {
+          orders(first: 250, query: $query) {
             nodes {
               id
               name
@@ -62,11 +57,7 @@ export const loader = async ({ request }) => {
                 nodes {
                   id
                   status
-                  assignedLocation {
-                    location {
-                      id
-                    }
-                  }
+                  assignedLocation { location { id } }
                 }
               }
             }
@@ -108,7 +99,6 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  // Case a: save settings
   if (intent === "save") {
     const selectedLocationId = formData.get("locationId");
     await prisma.configuration.upsert({
@@ -119,33 +109,24 @@ export const action = async ({ request }) => {
     return { status: "success", message: "Settings saved successfully!" };
   }
 
-  // Fetch current held orders to process releases
   if (intent === "release_all" || intent === "release_selected") {
     const targetLocationId = formData.get("locationId");
-
-    // Parse selected IDs if selected
     let selectedOrderIds = [];
     if (intent === "release_selected") {
-      const jsonIds = formData.get("selectedOrderIds");
-      selectedOrderIds = JSON.parse(jsonIds);
+      selectedOrderIds = JSON.parse(formData.get("selectedOrderIds"));
     }
 
-    // Fetch unfulfilled orders
     const holdQuery = await admin.graphql(
       `#graphql
         query getHeldOrders($query: String!) {
-          orders(first: 50, query: $query) {
+          orders(first: 250, query: $query) {
             nodes {
               id
               fulfillmentOrders(first: 5) {
                 nodes {
                   id
                   status
-                  assignedLocation {
-                    location {
-                      id
-                    }
-                  }
+                  assignedLocation { location { id } }
                 }
               }
             }
@@ -160,10 +141,7 @@ export const action = async ({ request }) => {
     const orderIdsToClean = new Set();
 
     holdData.data.orders.nodes.forEach(order => {
-      // If only want to release selected orders & skip orders not in our list
-      if (intent === "release_selected" && !selectedOrderIds.includes(order.id)) {
-        return;
-      }
+      if (intent === "release_selected" && !selectedOrderIds.includes(order.id)) return;
 
       order.fulfillmentOrders.nodes.forEach(fo => {
         if (fo.assignedLocation.location?.id === targetLocationId && fo.status === 'ON_HOLD') {
@@ -174,40 +152,18 @@ export const action = async ({ request }) => {
     });
 
     if (idsToRelease.length === 0) {
-      return { status: "info", message: "No matching held orders found to release." };
+      return { status: "info", message: "No matching held orders found." };
     }
 
-    // Release holds
     for (const id of idsToRelease) {
-      await admin.graphql(
-        `#graphql
-          mutation releaseHold($id: ID!) {
-            fulfillmentOrderReleaseHold(id: $id) {
-              userErrors { message }
-            }
-          }
-        `,
-        { variables: { id } }
-      );
+      await admin.graphql(`#graphql mutation releaseHold($id: ID!) { fulfillmentOrderReleaseHold(id: $id) { userErrors { message } } }`, { variables: { id } });
     }
-
-    // Remove tags
     for (const orderId of orderIdsToClean) {
-      await admin.graphql(
-        `#graphql
-          mutation tagsRemove($id: ID!, $tags: [String!]!) {
-            tagsRemove(id: $id, tags: $tags) {
-              userErrors { message }
-            }
-          }
-        `,
-        { variables: { id: orderId, tags: ["⚠️ Pre-Sale Hold"] } }
-      );
+      await admin.graphql(`#graphql mutation tagsRemove($id: ID!, $tags: [String!]!) { tagsRemove(id: $id, tags: $tags) { userErrors { message } } }`, { variables: { id: orderId, tags: ["⚠️ Pre-Sale Hold"] } });
     }
 
     return { status: "success", message: `Released ${idsToRelease.length} orders!` };
   }
-
   return null;
 };
 
@@ -219,20 +175,28 @@ export default function Index() {
   const nav = useNavigation();
 
   const [selectedLocation, setSelectedLocation] = useState(savedLocationId);
-  const [selectedItems, setSelectedItems] = useState([]); // State for checkboxes
+  const [selectedItems, setSelectedItems] = useState([]);
+
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10; // Items per page
+
+  // Calculate standard pagination logic
+  const totalItems = heldOrders.length;
+  const totalPages = Math.ceil(totalItems / itemsPerPage);
+  const isFirstPage = currentPage === 1;
+  const isLastPage = currentPage === totalPages || totalPages === 0;
+
+  // Get only the items for the current page
+  const currentItems = heldOrders.slice(
+    (currentPage - 1) * itemsPerPage,
+    currentPage * itemsPerPage
+  );
 
   const isLoading = nav.state === "submitting";
 
-  useEffect(() => {
-    setSelectedLocation(savedLocationId);
-  }, [savedLocationId]);
-
-  // Clear selection after a successful action
-  useEffect(() => {
-    if (actionData?.status === "success") {
-      setSelectedItems([]);
-    }
-  }, [actionData]);
+  useEffect(() => { setSelectedLocation(savedLocationId); }, [savedLocationId]);
+  useEffect(() => { if (actionData?.status === "success") setSelectedItems([]); }, [actionData]);
 
   const handleSave = () => {
     const formData = new FormData();
@@ -252,7 +216,6 @@ export default function Index() {
     const formData = new FormData();
     formData.append("intent", "release_selected");
     formData.append("locationId", selectedLocation);
-    // Send the list of IDs as a string
     formData.append("selectedOrderIds", JSON.stringify(selectedItems));
     submit(formData, { method: "POST" });
   };
@@ -260,23 +223,18 @@ export default function Index() {
   return (
     <Page title="Chrono Split Dashboard">
       <BlockStack gap="500">
-
         {actionData?.message && (
           <Banner tone={actionData.status === "success" ? "success" : "info"}>
             {actionData.message}
           </Banner>
         )}
 
-        {/* Section 1: Configuration */}
         <Layout>
           <Layout.Section>
             <Card>
               <BlockStack gap="400">
                 <Text as="h2" variant="headingMd">Configuration</Text>
-                <Text as="p">
-                  Select which warehouse contains your <b>Pre-Sale</b> inventory.
-                  Orders from this location will be automatically held and tagged.
-                </Text>
+                <Text as="p">Select Pre-Sale Location.</Text>
                 <Select
                   label="Pre-Sale Location"
                   options={[{ label: "Select...", value: "" }, ...locations.map(l => ({ label: l.name, value: l.id }))]}
@@ -284,54 +242,51 @@ export default function Index() {
                   value={selectedLocation}
                 />
                 <Box>
-                  <Button variant="primary" onClick={handleSave} loading={isLoading && nav.formData?.get("intent") === "save"}>
-                    Save Settings
-                  </Button>
+                  <Button variant="primary" onClick={handleSave} loading={isLoading && nav.formData?.get("intent") === "save"}>Save Settings</Button>
                 </Box>
               </BlockStack>
             </Card>
           </Layout.Section>
 
-          {/* Section 2: Operations */}
           {selectedLocation && (
             <Layout.Section>
               <Card>
                 <BlockStack gap="400">
                   <InlineStack align="space-between">
                     <Text as="h2" variant="headingMd">Operations</Text>
-                    {heldOrders.length > 0 ? (
-                      <Badge tone="warning">{heldOrders.length} Orders On Hold</Badge>
-                    ) : (
-                      <Badge tone="success">All Clear</Badge>
-                    )}
+                    <Badge tone={heldOrders.length > 0 ? "warning" : "success"}>
+                      {heldOrders.length > 0 ? `${heldOrders.length} Orders On Hold` : "All Clear"}
+                    </Badge>
                   </InlineStack>
 
                   {heldOrders.length > 0 ? (
                     <Card padding="0">
-                      {/* SELECTABLE RESOURCE LIST */}
                       <ResourceList
                         resourceName={{ singular: 'order', plural: 'orders' }}
-                        items={heldOrders}
+                        items={currentItems} // Pass ONLY current page items
                         selectedItems={selectedItems}
                         onSelectionChange={setSelectedItems}
                         selectable
+                        // PAGINATION PROPS
+                        pagination={{
+                          hasNext: !isLastPage,
+                          hasPrevious: !isFirstPage,
+                          onNext: () => setCurrentPage(c => c + 1),
+                          onPrevious: () => setCurrentPage(c => c - 1),
+                          label: `Page ${currentPage} of ${totalPages}`
+                        }}
                         renderItem={(item) => {
                           const { id, name, customer, date } = item;
                           const orderId = id.split('/').pop();
                           const orderUrl = `https://${shopDomain}/admin/orders/${orderId}`;
-
                           return (
                             <ResourceItem
                               id={id}
                               onClick={() => window.open(orderUrl, "_blank")}
                               accessibilityLabel={`View order ${name}`}
-                              media={
-                                <Avatar customer size="medium" name={customer} />
-                              }
+                              media={<Avatar customer size="medium" name={customer} />}
                             >
-                              <Text variant="bodyMd" fontWeight="bold" as="h3">
-                                {name}
-                              </Text>
+                              <Text variant="bodyMd" fontWeight="bold" as="h3">{name}</Text>
                               <div>{customer}</div>
                               <div>{date}</div>
                             </ResourceItem>
@@ -343,19 +298,15 @@ export default function Index() {
                     <Text as="p" tone="subdued">No orders are currently waiting in this location.</Text>
                   )}
 
-                  {/* Button group */}
                   <Box>
                     <ButtonGroup>
-                      {/* Release selected button */}
                       <Button
                         onClick={handleReleaseSelected}
-                        disabled={selectedItems.length === 0} // Only active if items checked
+                        disabled={selectedItems.length === 0}
                         loading={isLoading && nav.formData?.get("intent") === "release_selected"}
                       >
                         Release Selected ({selectedItems.length})
                       </Button>
-
-                      {/* Release all button */}
                       <Button
                         variant="primary"
                         tone="critical"
