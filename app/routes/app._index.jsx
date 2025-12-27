@@ -16,12 +16,15 @@ import {
   ResourceItem,
   Avatar,
   ButtonGroup,
-  TextField
+  TextField,
+  IndexTable,
+  LegacyCard,
+  useIndexResourceState
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
-// Loader: Fetch details for splitting
+// Loader: fetch orders and audit logs
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
@@ -41,6 +44,13 @@ export const loader = async ({ request }) => {
     where: { shop: session.shop },
   });
   const savedLocationId = config?.locationId || "";
+
+  // Audit Logs
+  const logs = await prisma.auditLog.findMany({
+    where: { shop: session.shop },
+    orderBy: { createdAt: 'desc' },
+    take: 10
+  });
 
   // Held orders
   let heldOrders = [];
@@ -104,16 +114,18 @@ export const loader = async ({ request }) => {
     locations: shopifyLocations,
     savedLocationId,
     heldOrders,
-    shopDomain: session.shop
+    shopDomain: session.shop,
+    logs: logs.map(l => ({ ...l, createdAt: l.createdAt.toISOString() }))
   };
 };
 
-// The "unlock -> split -> relock" logic
+// Perform action and log it with order names
 export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
 
+  // Save settings
   if (intent === "save") {
     const selectedLocationId = formData.get("locationId");
     await prisma.configuration.upsert({
@@ -121,9 +133,19 @@ export const action = async ({ request }) => {
       update: { locationId: selectedLocationId },
       create: { shop: session.shop, locationId: selectedLocationId },
     });
+
+    await prisma.auditLog.create({
+      data: {
+        shop: session.shop,
+        action: "SETTINGS",
+        description: `Updated Pre-Sale location to ID: ${selectedLocationId}`
+      }
+    });
+
     return { status: "success", message: "Settings saved successfully!" };
   }
 
+  // Release
   if (intent === "release_all" || intent === "release_selected") {
     const targetLocationId = formData.get("locationId");
     const filterText = formData.get("filterText") || "";
@@ -135,15 +157,13 @@ export const action = async ({ request }) => {
       targetOrderIds = JSON.parse(formData.get("filteredOrderIds"));
     }
 
-    console.log(`🚀 Starting Release. Filter: "${filterText}". Targets: ${targetOrderIds.length}`);
-
     const holdQuery = await admin.graphql(
       `#graphql
         query getHeldOrders($query: String!) {
           orders(first: 50, query: $query) {
             nodes {
               id
-              name # Added name so logs work
+              name # Need name for logs
               fulfillmentOrders(first: 5) {
                 nodes {
                   id
@@ -167,7 +187,9 @@ export const action = async ({ request }) => {
 
     const holdData = await holdQuery.json();
     let releasedCount = 0;
+    let splitCount = 0;
     const ordersToCheckForTagRemoval = new Set();
+    const releasedOrderNames = []; // New array to store names
 
     for (const order of holdData.data.orders.nodes) {
       if (!targetOrderIds.includes(order.id)) continue;
@@ -178,7 +200,6 @@ export const action = async ({ request }) => {
 
       if (!heldFulfillment) continue;
 
-      // 1. Identify matches
       const linesToRelease = heldFulfillment.lineItems.nodes.filter(lineNode => {
         if (!filterText) return true;
         const title = lineNode.lineItem?.title || "";
@@ -189,11 +210,9 @@ export const action = async ({ request }) => {
 
       const isPartialRelease = linesToRelease.length < heldFulfillment.lineItems.nodes.length;
 
-      // === Partial release logic ===
+      //  Split & Release
       if (isPartialRelease) {
-        console.log(`🪓 Order ${order.name}: Partial Release. Unlocking first...`);
-
-        // Step 1: Unlock (release hold on the whole thing so we can split)
+        // Unlock
         await admin.graphql(
           `#graphql
               mutation releaseHold($id: ID!) {
@@ -203,8 +222,7 @@ export const action = async ({ request }) => {
           { variables: { id: heldFulfillment.id } }
         );
 
-        // Step 2: Split (move the released items into a new fulfillment order)
-        console.log(`   -> Splitting ${linesToRelease.length} items out...`);
+        // Split
         const fulfillmentOrderLineItems = linesToRelease.map(line => ({
           id: line.id,
           quantity: line.remainingQuantity
@@ -223,55 +241,36 @@ export const action = async ({ request }) => {
           `,
           {
             variables: {
-              fulfillmentOrderSplits: [
-                {
-                  fulfillmentOrderId: heldFulfillment.id,
-                  fulfillmentOrderLineItems: fulfillmentOrderLineItems
-                }
-              ]
+              fulfillmentOrderSplits: [{
+                fulfillmentOrderId: heldFulfillment.id,
+                fulfillmentOrderLineItems: fulfillmentOrderLineItems
+              }]
             }
           }
         );
 
         const splitJson = await splitResponse.json();
-
         if (splitJson.data.fulfillmentOrderSplit.userErrors.length > 0) {
-          console.error("❌ Split Failed:", splitJson.data.fulfillmentOrderSplit.userErrors);
-          // Emergency: Re-hold the original if split failed
-          await admin.graphql(
-            `#graphql
-                  mutation hold($id: ID!, $hold: FulfillmentOrderHoldInput!) {
-                    fulfillmentOrderHold(id: $id, fulfillmentHold: $hold) { userErrors { message } }
-                  }
-                `,
-            { variables: { id: heldFulfillment.id, hold: { reason: "INVENTORY_OUT_OF_STOCK", reasonNotes: "Split failed, re-holding" } } }
-          );
           continue;
         }
 
-        // Step c: Relock (re-hold the the other fulfillment items)
-        console.log(`   -> Re-locking remaining items (ID: ${heldFulfillment.id})...`);
+        // Re-lock original
         await admin.graphql(
           `#graphql
               mutation hold($id: ID!, $hold: FulfillmentOrderHoldInput!) {
                 fulfillmentOrderHold(id: $id, fulfillmentHold: $hold) { userErrors { message } }
               }
             `,
-          {
-            variables: {
-              id: heldFulfillment.id,
-              hold: { reason: "INVENTORY_OUT_OF_STOCK", reasonNotes: "Automatic Hold: Pre-Sale Remaining Items" }
-            }
-          }
+          { variables: { id: heldFulfillment.id, hold: { reason: "INVENTORY_OUT_OF_STOCK", reasonNotes: "Remaining Items" } } }
         );
 
-        // Success: The new fulfillment order created by split is released.
         releasedCount++;
+        splitCount++;
         ordersToCheckForTagRemoval.add(order.id);
+        releasedOrderNames.push(order.name); // Track Name
 
       } else {
-        // === Full release logic ===
-        console.log(`🔓 Order ${order.name}: Full Release.`);
+        //  Full release
         await admin.graphql(
           `#graphql
               mutation releaseHold($id: ID!) {
@@ -282,6 +281,7 @@ export const action = async ({ request }) => {
         );
         releasedCount++;
         ordersToCheckForTagRemoval.add(order.id);
+        releasedOrderNames.push(order.name); // Track Name
       }
     }
 
@@ -303,11 +303,9 @@ export const action = async ({ request }) => {
         { variables: { id: orderId } }
       );
       const checkData = await checkQuery.json();
-
       const remainingHolds = checkData.data.order.fulfillmentOrders.nodes.some(fo =>
         fo.assignedLocation.location?.id === targetLocationId && fo.status === 'ON_HOLD'
       );
-
       if (!remainingHolds) {
         await admin.graphql(
           `#graphql
@@ -320,14 +318,35 @@ export const action = async ({ request }) => {
       }
     }
 
+    // Logging
+    const actionType = splitCount > 0 ? "SPLIT_RELEASE" : "RELEASE";
+
+    // Create a string like: "#1001, #1002, #1003"
+    const orderListString = releasedOrderNames.join(", ");
+
+    let logDetails = "";
+    if (filterText) {
+      logDetails = `Released items matching '${filterText}' in ${releasedCount} orders: ${orderListString}`;
+    } else {
+      logDetails = `Released ${releasedCount} orders: ${orderListString}`;
+    }
+
+    await prisma.auditLog.create({
+      data: {
+        shop: session.shop,
+        action: actionType,
+        description: logDetails
+      }
+    });
+
     return { status: "success", message: `Processed ${releasedCount} release actions.` };
   }
   return null;
 };
 
-// 3. UI components
+// UI components
 export default function Index() {
-  const { locations, savedLocationId, heldOrders, shopDomain } = useLoaderData();
+  const { locations, savedLocationId, heldOrders, shopDomain, logs } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
   const nav = useNavigation();
@@ -337,7 +356,7 @@ export default function Index() {
   const [queryValue, setQueryValue] = useState("");
 
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 10;
+  const itemsPerPage = 5;
 
   useEffect(() => { setSelectedLocation(savedLocationId); }, [savedLocationId]);
   useEffect(() => { if (actionData?.status === "success") setSelectedItems([]); }, [actionData]);
@@ -352,11 +371,7 @@ export default function Index() {
   const totalPages = Math.ceil(totalItems / itemsPerPage);
   const isFirstPage = currentPage === 1;
   const isLastPage = currentPage === totalPages || totalPages === 0;
-
-  const currentItems = filteredOrders.slice(
-    (currentPage - 1) * itemsPerPage,
-    currentPage * itemsPerPage
-  );
+  const currentItems = filteredOrders.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
 
   const isLoading = nav.state === "submitting";
 
@@ -386,14 +401,18 @@ export default function Index() {
     submit(formData, { method: "POST" });
   };
 
-  const handleQueryValueChange = useCallback((value) => {
-    setQueryValue(value);
-    setCurrentPage(1);
-  }, []);
+  const handleQueryValueChange = useCallback((value) => { setQueryValue(value); setCurrentPage(1); }, []);
+  const handleQueryClear = useCallback(() => { handleQueryValueChange(""); }, [handleQueryValueChange]);
 
-  const handleQueryClear = useCallback(() => {
-    handleQueryValueChange("");
-  }, [handleQueryValueChange]);
+  const logRows = logs.map((log, index) => (
+    <IndexTable.Row id={log.id} key={log.id} position={index}>
+      <IndexTable.Cell>
+        <Text fontWeight="bold" as="span">{log.action}</Text>
+      </IndexTable.Cell>
+      <IndexTable.Cell>{log.description}</IndexTable.Cell>
+      <IndexTable.Cell>{new Date(log.createdAt).toLocaleString()}</IndexTable.Cell>
+    </IndexTable.Row>
+  ));
 
   return (
     <Page title="Chrono Split Dashboard">
@@ -405,24 +424,23 @@ export default function Index() {
         )}
 
         <Layout>
+          {/* Config */}
           <Layout.Section>
             <Card>
               <BlockStack gap="400">
                 <Text as="h2" variant="headingMd">Configuration</Text>
-                <Text as="p">Select Pre-Sale Location.</Text>
                 <Select
                   label="Pre-Sale Location"
                   options={[{ label: "Select...", value: "" }, ...locations.map(l => ({ label: l.name, value: l.id }))]}
                   onChange={setSelectedLocation}
                   value={selectedLocation}
                 />
-                <Box>
-                  <Button variant="primary" onClick={handleSave} loading={isLoading && nav.formData?.get("intent") === "save"}>Save Settings</Button>
-                </Box>
+                <Box><Button variant="primary" onClick={handleSave} loading={isLoading && nav.formData?.get("intent") === "save"}>Save Settings</Button></Box>
               </BlockStack>
             </Card>
           </Layout.Section>
 
+          {/* Operations */}
           {selectedLocation && (
             <Layout.Section>
               <Card>
@@ -441,7 +459,7 @@ export default function Index() {
                       value={queryValue}
                       onChange={handleQueryValueChange}
                       autoComplete="off"
-                      placeholder="Filter by Item (e.g. 'Snowboard') to Release Specific Items"
+                      placeholder="Filter by Item (e.g. 'Snowboard')..."
                       prefix={<Text variant="bodyMd">🔍</Text>}
                     />
                   </div>
@@ -494,7 +512,7 @@ export default function Index() {
                         disabled={selectedItems.length === 0}
                         loading={isLoading && nav.formData?.get("intent") === "release_selected"}
                       >
-                        {queryValue && selectedItems.length > 0 ? `Release '${queryValue}' in Selected` : `Release Selected`}
+                        Release Selected
                       </Button>
                       <Button
                         variant="primary"
@@ -503,7 +521,7 @@ export default function Index() {
                         disabled={filteredOrders.length === 0}
                         loading={isLoading && nav.formData?.get("intent") === "release_all"}
                       >
-                        {queryValue ? `Release '${queryValue}' in All (${filteredOrders.length})` : `Release All Holds (${filteredOrders.length})`}
+                        {queryValue ? `Release Filtered (${filteredOrders.length})` : `Release All Holds`}
                       </Button>
                     </ButtonGroup>
                   </Box>
@@ -511,6 +529,34 @@ export default function Index() {
               </Card>
             </Layout.Section>
           )}
+
+          {/* Activity history */}
+          <Layout.Section>
+            <Card padding="0">
+              <Box padding="400">
+                <Text as="h2" variant="headingMd">Activity History</Text>
+              </Box>
+              {logs.length > 0 ? (
+                <IndexTable
+                  resourceName={{ singular: 'log', plural: 'logs' }}
+                  itemCount={logs.length}
+                  headings={[
+                    { title: 'Action' },
+                    { title: 'Details' },
+                    { title: 'Time' },
+                  ]}
+                  selectable={false}
+                >
+                  {logRows}
+                </IndexTable>
+              ) : (
+                <Box padding="400">
+                  <Text tone="subdued">No activity recorded yet.</Text>
+                </Box>
+              )}
+            </Card>
+          </Layout.Section>
+
         </Layout>
       </BlockStack>
     </Page>
