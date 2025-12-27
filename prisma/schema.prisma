@@ -36,3 +36,11 @@ model Configuration {
   shop        String @unique
   locationId  String
 }
+
+model AuditLog {
+  id          Int      @id @default(autoincrement())
+  shop        String
+  action      String   // e.g., "Release", "Split", "Settings"
+  description String   // e.g., "Released 5 snowboard orders"
+  createdAt   DateTime @default(now())
+}
